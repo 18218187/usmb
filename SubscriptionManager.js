@@ -1,0 +1,773 @@
+import Database from "../services/Database";
+import Environment from "../helpers/Environment";
+import OneSignalEvent from "../services/OneSignalEvent";
+import { ServiceWorkerActiveState } from "../helpers/ServiceWorkerHelper";
+import SdkEnvironment from "./SdkEnvironment";
+import { NotificationPermission } from "../models/NotificationPermission";
+import { SubscriptionStateKind } from "../models/SubscriptionStateKind";
+import { WindowEnvironmentKind } from "../models/WindowEnvironmentKind";
+import { PermissionUtils } from "../utils/PermissionUtils";
+import { base64ToUint8Array } from "../utils/Encoding";
+import {
+  InvalidStateError,
+  InvalidStateReason,
+} from "../errors/InvalidStateError";
+import NotImplementedError from "../errors/NotImplementedError";
+import PushPermissionNotGrantedError, {
+  PushPermissionNotGrantedErrorReason,
+} from "../errors/PushPermissionNotGrantedError";
+import { SdkInitError, SdkInitErrorKind } from "../errors/SdkInitError";
+import ServiceWorkerRegistrationError from "../errors/ServiceWorkerRegistrationError";
+import SubscriptionError, {
+  SubscriptionErrorReason,
+} from "../errors/SubscriptionError";
+import Log from "../libraries/Log";
+import { RawPushSubscription } from "../models/RawPushSubscription";
+import FuturePushSubscriptionRecord from "../../page/userModel/FuturePushSubscriptionRecord";
+import { SessionOrigin } from "../models/Session";
+import { executeCallback, logMethodCall } from "../utils/utils";
+import UserDirector from "../../onesignal/UserDirector";
+import { isCompleteSubscriptionObject } from "../../core/utils/typePredicates";
+import { bowserCastle } from "../utils/bowserCastle";
+export class SubscriptionManager {
+  constructor(context, config) {
+    this.safariPermissionPromptFailed = false;
+    this.context = context;
+    this.config = config;
+  }
+  /**
+   * Returns a promise that resolves to true if all required conditions for push messaging are met; otherwise, false.
+   * @returns {Promise<boolean>}
+   */
+  async isPushNotificationsEnabled() {
+    const subscriptionState = await this.getSubscriptionState();
+    return subscriptionState.subscribed && !subscriptionState.optedOut;
+  }
+  /**
+   * isOptedIn - true if the user has granted permission and has not opted out.
+   * IMPORTANT: This method is not the same as isPushNotificationsEnabled(). isPushNotificationsEnabled() represents
+   * the current state of the user's subscription, while isOptedIn() represents the user's intention.
+   * @returns {Promise<boolean>}
+   */
+  async isOptedIn() {
+    const subscriptionState = await this.getSubscriptionState();
+    const permission =
+      await OneSignal.context.permissionManager.getPermissionStatus();
+    return permission === "granted" && !subscriptionState.optedOut;
+  }
+  /**
+   * Legacy method for determining if the user is subscribed.
+   * @param callback
+   * @returns
+   */
+  async isOptedOut(callback) {
+    logMethodCall("isOptedOut", callback);
+    const { optedOut } = await Database.getSubscription();
+    executeCallback(callback, optedOut);
+    return optedOut;
+  }
+  /**
+   * Subscribes for a web push subscription.
+   *
+   * This method can be called from the page context or a webpage a service worker context
+   * and will select the correct method.
+   */
+  async subscribe(subscriptionStrategy) {
+    const env = SdkEnvironment.getWindowEnv();
+    let rawPushSubscription;
+    switch (env) {
+      case WindowEnvironmentKind.ServiceWorker:
+        rawPushSubscription = await this.subscribeFcmFromWorker(
+          subscriptionStrategy
+        );
+        break;
+      case WindowEnvironmentKind.Host:
+        /*
+                  Check our notification permission before subscribing.
+        
+                  - If notifications are blocked, we can't subscribe.
+                  - If notifications are granted, the user should be completely resubscribed.
+                  - If notifications permissions are untouched, the user will be prompted and then
+                    subscribed.
+        
+                  Subscribing is only possible on the top-level frame, so there's no permission ambiguity
+                  here.
+                */
+        if (
+          (await OneSignal.context.permissionManager.getPermissionStatus()) ===
+          NotificationPermission.Denied
+        )
+          throw new PushPermissionNotGrantedError(
+            PushPermissionNotGrantedErrorReason.Blocked
+          );
+        if (Environment.useSafariLegacyPush()) {
+          rawPushSubscription = await this.subscribeSafari();
+          await this._updatePushSubscriptionModelWithRawSubscription(
+            rawPushSubscription
+          );
+          /* Now that permissions have been granted, install the service worker */
+          Log.info("Installing SW on Safari");
+          try {
+            await this.context.serviceWorkerManager.installWorker();
+            Log.info("SW on Safari successfully installed");
+          } catch (e) {
+            Log.error("SW on Safari failed to install.");
+          }
+        } else {
+          rawPushSubscription = await this.subscribeFcmFromPage(
+            subscriptionStrategy
+          );
+          await this._updatePushSubscriptionModelWithRawSubscription(
+            rawPushSubscription
+          );
+        }
+        break;
+      default:
+        throw new InvalidStateError(InvalidStateReason.UnsupportedEnvironment);
+    }
+    return rawPushSubscription;
+  }
+  async _updatePushSubscriptionModelWithRawSubscription(rawPushSubscription) {
+    const pushModel = await OneSignal.coreDirector.getPushSubscriptionModel();
+    if (!pushModel) {
+      OneSignal.coreDirector.generatePushSubscriptionModel(rawPushSubscription);
+      await UserDirector.createAndHydrateUser();
+      return;
+    } else {
+      // resubscribing. update existing push subscription model
+      const serializedSubscriptionRecord = new FuturePushSubscriptionRecord(
+        rawPushSubscription
+      ).serialize();
+      const keys = Object.keys(serializedSubscriptionRecord);
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (serializedSubscriptionRecord[key]) {
+          pushModel.set(key, serializedSubscriptionRecord[key]);
+        }
+      }
+    }
+  }
+  async updateNotificationTypes() {
+    const notificationTypes = await this.getNotificationTypes();
+    await this.updatePushSubscriptionNotificationTypes(notificationTypes);
+  }
+  async getNotificationTypes() {
+    const { optedOut } = await Database.getSubscription();
+    if (optedOut) {
+      return SubscriptionStateKind.UserOptedOut;
+    }
+    const permission =
+      await OneSignal.context.permissionManager.getPermissionStatus();
+    if (permission === "granted") {
+      return SubscriptionStateKind.Subscribed;
+    }
+    return SubscriptionStateKind.NoNativePermission;
+  }
+  async updatePushSubscriptionNotificationTypes(notificationTypes) {
+    const pushModel = await OneSignal.coreDirector.getPushSubscriptionModel();
+    if (!pushModel) {
+      Log.info("No Push Subscription yet to update notification_types.");
+      return;
+    }
+    pushModel.set("notification_types", notificationTypes);
+    pushModel.set(
+      "enabled",
+      notificationTypes === SubscriptionStateKind.Subscribed
+    );
+  }
+  /**
+   * Creates a device record from the provided raw push subscription and forwards this device record
+   * to OneSignal to create or update the device ID.
+   *
+   * @param rawPushSubscription The raw push subscription obtained from calling subscribe(). This
+   * can be null, in which case OneSignal's device record is set to unsubscribed.
+   *
+   * @param subscriptionState Describes whether the device record is subscribed, unsubscribed, or in
+   * another state. By default, this is set from the availability of rawPushSubscription (exists:
+   * Subscribed, null: Unsubscribed). Other use cases may result in creation of a device record that
+   * warrants a special subscription state. For example, a device ID can be retrieved by providing
+   * an identifier, and a new device record will be created if the identifier didn't exist. These
+   * records are marked with a special subscription state for tracking purposes.
+   */
+  async registerSubscription(pushSubscription, subscriptionState) {
+    /*
+          This may be called after the RawPushSubscription has been serialized across a postMessage
+          frame. This means it will only have object properties and none of the functions. We have to
+          recreate the RawPushSubscription.
+    
+          Keep in mind pushSubscription can be null in cases where resubscription isn't possible
+          (blocked permission).
+        */
+    if (pushSubscription) {
+      pushSubscription = RawPushSubscription.deserialize(pushSubscription);
+    }
+    if (await this.isAlreadyRegisteredWithOneSignal()) {
+      await this.context.updateManager.sendPushDeviceRecordUpdate();
+    } else {
+      this.context.sessionManager.upsertSession(SessionOrigin.UserCreate);
+    }
+    const subscription = await Database.getSubscription();
+    // User Model: TO DO: Remove this once we have a better way to determine if the user is subscribed
+    subscription.deviceId = "99999999-9999-9999-9999-999999999999";
+    subscription.optedOut = false;
+    if (pushSubscription) {
+      if (Environment.useSafariLegacyPush()) {
+        subscription.subscriptionToken = pushSubscription.safariDeviceToken;
+      } else {
+        subscription.subscriptionToken = pushSubscription.w3cEndpoint
+          ? pushSubscription.w3cEndpoint.toString()
+          : null;
+      }
+    } else {
+      subscription.subscriptionToken = null;
+    }
+    await Database.setSubscription(subscription);
+    if (SdkEnvironment.getWindowEnv() !== WindowEnvironmentKind.ServiceWorker) {
+      OneSignalEvent.trigger(OneSignal.EVENTS.REGISTERED);
+    }
+    if (typeof OneSignal !== "undefined") {
+      OneSignal._sessionInitAlreadyRunning = false;
+    }
+    return subscription;
+  }
+  /**
+   * Used before subscribing for push, we request notification permissions
+   * before installing the service worker to prevent non-subscribers from
+   * querying our server for an updated service worker every 24 hours.
+   */
+  static async requestPresubscribeNotificationPermission() {
+    return await SubscriptionManager.requestNotificationPermission();
+  }
+  async unsubscribe(strategy) {
+    if (strategy === 0 /* UnsubscriptionStrategy.DestroySubscription */) {
+      throw new NotImplementedError();
+    } else if (strategy === 1 /* UnsubscriptionStrategy.MarkUnsubscribed */) {
+      if (
+        SdkEnvironment.getWindowEnv() === WindowEnvironmentKind.ServiceWorker
+      ) {
+        await Database.put("Options", { key: "optedOut", value: true });
+      } else {
+        throw new NotImplementedError();
+      }
+    } else {
+      throw new NotImplementedError();
+    }
+  }
+  /**
+   * Calls Notification.requestPermission(), but returns a Promise instead of
+   * accepting a callback like the actual Notification.requestPermission();
+   *
+   * window.Notification.requestPermission: The callback was deprecated since Gecko 46 in favor of a Promise
+   */
+  static async requestNotificationPermission() {
+    const results = await window.Notification.requestPermission();
+    // TODO: Clean up our custom NotificationPermission enum
+    //         in favor of TS union type NotificationPermission instead of converting
+    return NotificationPermission[results];
+  }
+  async isAlreadyRegisteredWithOneSignal() {
+    const { deviceId } = await Database.getSubscription();
+    return !!deviceId;
+  }
+  async subscribeSafariPromptPermission() {
+    const requestPermission = (url) => {
+      return new Promise((resolve) => {
+        window.safari.pushNotification.requestPermission(
+          url,
+          this.config.safariWebId,
+          { app_id: this.config.appId },
+          (response) => {
+            if (response && response.deviceToken) {
+              resolve(response.deviceToken.toLowerCase());
+            } else {
+              resolve(null);
+            }
+          }
+        );
+      });
+    };
+    if (!this.safariPermissionPromptFailed) {
+      return requestPermission(
+        `${SdkEnvironment.getOneSignalApiUrl().toString()}/safari/apps/${
+          this.config.appId
+        }`
+      );
+    } else {
+      // If last attempt failed, retry with the legacy URL
+      return requestPermission(
+        `${SdkEnvironment.getOneSignalApiUrl().toString()}/safari`
+      );
+    }
+  }
+  async subscribeSafari() {
+    const pushSubscriptionDetails = new RawPushSubscription();
+    if (!this.config.safariWebId) {
+      throw new SdkInitError(SdkInitErrorKind.MissingSafariWebId);
+    }
+    const { deviceToken: existingDeviceToken } =
+      window.safari.pushNotification.permission(this.config.safariWebId);
+    if (existingDeviceToken) {
+      pushSubscriptionDetails.setFromSafariSubscription(
+        existingDeviceToken.toLowerCase()
+      );
+      return pushSubscriptionDetails;
+    }
+    /*
+          We're about to show the Safari native permission request. It can fail for a number of
+          reasons, e.g.:
+            - Setup-related reasons when developers just starting to get set up
+              - Address bar URL doesn't match safari certificate allowed origins (case-sensitive)
+              - Safari web ID doesn't match provided web ID
+              - Browsing in a Safari private window
+              - Bad icon DPI
+    
+          but shouldn't fail for sites that have already gotten Safari working.
+    
+          We'll show the permissionPromptDisplay event if the Safari user isn't already subscribed,
+          otherwise an already subscribed Safari user would not see the permission request again.
+        */
+    OneSignalEvent.trigger(OneSignal.EVENTS.PERMISSION_PROMPT_DISPLAYED);
+    const deviceToken = await this.subscribeSafariPromptPermission();
+    PermissionUtils.triggerNotificationPermissionChanged();
+    if (deviceToken) {
+      pushSubscriptionDetails.setFromSafariSubscription(deviceToken);
+    } else {
+      this.safariPermissionPromptFailed = true;
+      throw new SubscriptionError(SubscriptionErrorReason.InvalidSafariSetup);
+    }
+    return pushSubscriptionDetails;
+  }
+  async subscribeFcmFromPage(subscriptionStrategy) {
+    /*
+          Before installing the service worker, request notification permissions. If
+          the visitor doesn't grant permissions, this saves bandwidth bleeding from
+          an unused install service worker periodically fetching an updated version
+          from our CDN.
+        */
+    /*
+          Trigger the permissionPromptDisplay event to the best of our knowledge.
+        */
+    if (
+      SdkEnvironment.getWindowEnv() === WindowEnvironmentKind.Host &&
+      Notification.permission === NotificationPermission.Default
+    ) {
+      await OneSignalEvent.trigger(
+        OneSignal.EVENTS.PERMISSION_PROMPT_DISPLAYED
+      );
+      const permission =
+        await SubscriptionManager.requestPresubscribeNotificationPermission();
+      /*
+              The native event handler does not broadcast an event for dismissing the
+              prompt, because going from "default" permissions to "default"
+              permissions isn't a change. We specifically broadcast "default" to "default" changes.
+             */
+      const forcePermissionChangeEvent =
+        permission === NotificationPermission.Default;
+      await PermissionUtils.triggerNotificationPermissionChanged(
+        forcePermissionChangeEvent
+      );
+      // If the user did not grant push permissions, throw and exit
+      switch (permission) {
+        case NotificationPermission.Default:
+          Log.debug(
+            "Exiting subscription and not registering worker because the permission was dismissed."
+          );
+          OneSignal._sessionInitAlreadyRunning = false;
+          throw new PushPermissionNotGrantedError(
+            PushPermissionNotGrantedErrorReason.Dismissed
+          );
+        case NotificationPermission.Denied:
+          Log.debug(
+            "Exiting subscription and not registering worker because the permission was blocked."
+          );
+          OneSignal._sessionInitAlreadyRunning = false;
+          throw new PushPermissionNotGrantedError(
+            PushPermissionNotGrantedErrorReason.Blocked
+          );
+      }
+    }
+    /* Now that permissions have been granted, install the service worker */
+    let workerRegistration;
+    try {
+      workerRegistration =
+        await this.context.serviceWorkerManager.installWorker();
+    } catch (err) {
+      if (err instanceof ServiceWorkerRegistrationError) {
+        if (err.status === 403) {
+          await this.context.subscriptionManager.registerFailedSubscription(
+            SubscriptionStateKind.ServiceWorkerStatus403,
+            this.context
+          );
+        } else if (err.status === 404) {
+          await this.context.subscriptionManager.registerFailedSubscription(
+            SubscriptionStateKind.ServiceWorkerStatus404,
+            this.context
+          );
+        }
+      }
+      throw err;
+    }
+    if (!workerRegistration) {
+      throw new Error("OneSignal service worker not found!");
+    }
+    Log.debug(
+      "[Subscription Manager] Service worker is ready to continue subscribing."
+    );
+    return await this.subscribeWithVapidKey(
+      workerRegistration.pushManager,
+      subscriptionStrategy
+    );
+  }
+  async subscribeFcmFromWorker(subscriptionStrategy) {
+    /*
+          We're running inside of the service worker.
+    
+          Check to make sure our registration is activated, otherwise we can't
+          subscribe for push.
+    
+          HACK: Firefox doesn't set self.registration.active in the service worker
+          context. From a non-service worker context, like
+          navigator.serviceWorker.getRegistration().active, the property actually is
+          set, but it's just not set within the service worker context.
+    
+          Because of this, we're not able to check for this property on Firefox.
+         */
+    const swRegistration = self.registration;
+    if (!swRegistration.active && bowserCastle().name !== "firefox") {
+      throw new InvalidStateError(InvalidStateReason.ServiceWorkerNotActivated);
+      /*
+              Or should we wait for the service worker to be ready?
+      
+              await new Promise(resolve => self.onactivate = resolve);
+             */
+    }
+    /*
+          Check to make sure push permissions have been granted.
+         */
+    const pushPermission = await swRegistration.pushManager.permissionState({
+      userVisibleOnly: true,
+    });
+    if (pushPermission === "denied") {
+      throw new PushPermissionNotGrantedError(
+        PushPermissionNotGrantedErrorReason.Blocked
+      );
+    } else if (pushPermission === "prompt") {
+      throw new PushPermissionNotGrantedError(
+        PushPermissionNotGrantedErrorReason.Default
+      );
+    }
+    return await this.subscribeWithVapidKey(
+      swRegistration.pushManager,
+      subscriptionStrategy
+    );
+  }
+  /**
+   * Returns the correct VAPID key to use for subscription based on the browser type.
+   *
+   * If the VAPID key isn't present, undefined is returned instead of null.
+   */
+  getVapidKeyForBrowser() {
+    // Specifically return undefined instead of null if the key isn't available
+    let key = undefined;
+    if (bowserCastle().name === "firefox") {
+      /*
+              Firefox uses VAPID for application identification instead of
+              authentication, and so all apps share an identification key.
+             */
+      key = this.config.onesignalVapidPublicKey;
+    } else {
+      /*
+              Chrome and Chrome-like browsers including Opera and Yandex use VAPID for
+              authentication, and so each app uses a uniquely generated key.
+             */
+      key = this.config.vapidPublicKey;
+    }
+    if (key) {
+      return base64ToUint8Array(key).buffer;
+    } else {
+      return undefined;
+    }
+  }
+  /**
+   * Uses the browser's PushManager interface to actually subscribe for a web push subscription.
+   *
+   * @param pushManager An instance of the browser's push manager, either from the page or from the
+   * service worker.
+   *
+   * @param subscriptionStrategy Given an existing push subscription, describes whether the existing
+   * push subscription is resubscribed as-is leaving it unchanged, or unsubscribed to make room for
+   * a new push subscription.
+   */
+  async subscribeWithVapidKey(pushManager, subscriptionStrategy) {
+    /*
+          Always try subscribing using VAPID by providing an applicationServerKey, except for cases
+          where the user is already subscribed, handled below.
+         */
+    const existingPushSubscription = await pushManager.getSubscription();
+    /* Depending on the subscription strategy, handle existing subscription in various ways */
+    switch (subscriptionStrategy) {
+      case 0 /* SubscriptionStrategyKind.ResubscribeExisting */:
+        if (!existingPushSubscription) break;
+        if (existingPushSubscription.options) {
+          Log.debug(
+            "[Subscription Manager] An existing push subscription exists and it's options is not null."
+          );
+        } else {
+          Log.debug(
+            "[Subscription Manager] An existing push subscription exists and options is null. " +
+              "Unsubscribing from push first now."
+          );
+          /*
+                      NOTE: Only applies to rare edge case of migrating from senderId to a VAPID subscription
+                      There isn't a great solution if PushSubscriptionOptions (supported on Chrome 54+) isn't
+                      supported.
+          
+                      We want to subscribe the user, but we don't know whether the user was subscribed via
+                      GCM's manifest.json or FCM's VAPID.
+          
+                      This bug (https://bugs.chromium.org/p/chromium/issues/detail?id=692577) shows that a
+                      mismatched sender ID error is possible if you subscribe via FCM's VAPID while the user
+                      was originally subscribed via GCM's manifest.json (fails silently).
+          
+                      Because of this, we should unsubscribe the user from push first and then resubscribe
+                      them.
+                    */
+          /* We're unsubscribing, so we want to store the created at timestamp */
+          await SubscriptionManager.doPushUnsubscribe(existingPushSubscription);
+        }
+        break;
+      case 1 /* SubscriptionStrategyKind.SubscribeNew */:
+        /* Since we want a new subscription every time with this strategy, just unsubscribe. */
+        if (existingPushSubscription) {
+          await SubscriptionManager.doPushUnsubscribe(existingPushSubscription);
+        }
+        break;
+    }
+    // Actually subscribe the user to push
+    const [newPushSubscription, isNewSubscription] =
+      await SubscriptionManager.doPushSubscribe(
+        pushManager,
+        this.getVapidKeyForBrowser()
+      );
+    // Update saved create and expired times
+    await SubscriptionManager.updateSubscriptionTime(
+      isNewSubscription,
+      newPushSubscription.expirationTime
+    );
+    // Create our own custom object from the browser's native PushSubscription object
+    const pushSubscriptionDetails =
+      RawPushSubscription.setFromW3cSubscription(newPushSubscription);
+    return pushSubscriptionDetails;
+  }
+  static async updateSubscriptionTime(updateCreatedAt, expirationTime) {
+    const bundle = await Database.getSubscription();
+    if (updateCreatedAt) {
+      bundle.createdAt = new Date().getTime();
+    }
+    bundle.expirationTime = expirationTime;
+    await Database.setSubscription(bundle);
+  }
+  static async doPushUnsubscribe(pushSubscription) {
+    Log.debug(
+      "[Subscription Manager] Unsubscribing existing push subscription."
+    );
+    const result = await pushSubscription.unsubscribe();
+    Log.debug(
+      `[Subscription Manager] Unsubscribing existing push subscription result: ${result}`
+    );
+    return result;
+  }
+  // Subscribes the ServiceWorker for a pushToken.
+  // If there is an error doing so unsubscribe from existing and try again
+  //    - This handles subscribing to new server VAPID key if it has changed.
+  // return type - [PushSubscription, createdNewPushSubscription(boolean)]
+  static async doPushSubscribe(pushManager, applicationServerKey) {
+    if (!applicationServerKey) {
+      throw new Error(
+        "Missing required 'applicationServerKey' to subscribe for push notifications!"
+      );
+    }
+    const subscriptionOptions = {
+      userVisibleOnly: true,
+      applicationServerKey: applicationServerKey,
+    };
+    Log.debug(
+      "[Subscription Manager] Subscribing to web push with these options:",
+      subscriptionOptions
+    );
+    try {
+      const existingSubscription = await pushManager.getSubscription();
+      return [
+        await pushManager.subscribe(subscriptionOptions),
+        !existingSubscription,
+      ];
+    } catch (e) {
+      if (e.name == "InvalidStateError") {
+        // This exception is thrown if the key for the existing applicationServerKey is different,
+        //    so we must unregister first.
+        // In Chrome, e.message contains will be the following in this case for reference;
+        // Registration failed - A subscription with a different applicationServerKey (or gcm_sender_id) already exists;
+        //    to change the applicationServerKey, unsubscribe then resubscribe.
+        Log.warn(
+          "[Subscription Manager] Couldn't re-subscribe due to applicationServerKey changing, " +
+            "unsubscribe and attempting to subscribe with new key.",
+          e
+        );
+        const subscription = await pushManager.getSubscription();
+        if (subscription) {
+          await SubscriptionManager.doPushUnsubscribe(subscription);
+        }
+        return [await pushManager.subscribe(subscriptionOptions), true];
+      } else throw e; // If some other error, bubble the exception up
+    }
+  }
+  async isSubscriptionExpiring() {
+    const serviceWorkerState =
+      await this.context.serviceWorkerManager.getActiveState();
+    if (!(serviceWorkerState === ServiceWorkerActiveState.OneSignalWorker)) {
+      /* If the service worker isn't activated, there's no subscription to look for */
+      return false;
+    }
+    const serviceWorkerRegistration =
+      await this.context.serviceWorkerManager.getRegistration();
+    if (!serviceWorkerRegistration) return false;
+    // It's possible to get here in Safari 11.1+ version
+    //   since they released support for service workers but not push api.
+    if (!serviceWorkerRegistration.pushManager) return false;
+    const pushSubscription =
+      await serviceWorkerRegistration.pushManager.getSubscription();
+    // Not subscribed to web push
+    if (!pushSubscription) return false;
+    // No push subscription expiration time
+    if (!pushSubscription.expirationTime) return false;
+    let { createdAt: subscriptionCreatedAt } = await Database.getSubscription();
+    if (!subscriptionCreatedAt) {
+      /* If we don't have a record of when the subscription was created, set it into the future to
+            guarantee expiration and obtain a new subscription */
+      const ONE_YEAR = 1000 * 60 * 60 * 24 * 365;
+      subscriptionCreatedAt = new Date().getTime() + ONE_YEAR;
+    }
+    const midpointExpirationTime =
+      subscriptionCreatedAt +
+      (pushSubscription.expirationTime - subscriptionCreatedAt) / 2;
+    return (
+      !!pushSubscription.expirationTime &&
+      /* The current time (in UTC) is past the expiration time (also in UTC) */
+      (new Date().getTime() >= pushSubscription.expirationTime ||
+        new Date().getTime() >= midpointExpirationTime)
+    );
+  }
+  /**
+   * Returns an object describing the user's actual push subscription state and opt-out status.
+   */
+  async getSubscriptionState() {
+    const windowEnv = SdkEnvironment.getWindowEnv();
+    switch (windowEnv) {
+      case WindowEnvironmentKind.ServiceWorker: {
+        const pushSubscription =
+          await self.registration.pushManager.getSubscription();
+        const { optedOut } = await Database.getSubscription();
+        return {
+          subscribed: !!pushSubscription,
+          optedOut: !!optedOut,
+        };
+      }
+      default: {
+        /* Regular browser window environments */
+        return this.getSubscriptionStateFromBrowserContext();
+      }
+    }
+  }
+  async getSubscriptionStateFromBrowserContext() {
+    var _a, _b;
+    const { optedOut, subscriptionToken } = await Database.getSubscription();
+    const pushSubscriptionOSModel =
+      await OneSignal.coreDirector.getPushSubscriptionModel();
+    const isValidPushSubscription =
+      isCompleteSubscriptionObject(
+        pushSubscriptionOSModel === null || pushSubscriptionOSModel === void 0
+          ? void 0
+          : pushSubscriptionOSModel.data
+      ) &&
+      !!(pushSubscriptionOSModel === null || pushSubscriptionOSModel === void 0
+        ? void 0
+        : pushSubscriptionOSModel.onesignalId);
+    if (Environment.useSafariLegacyPush()) {
+      const subscriptionState =
+        (_b =
+          (_a = window.safari) === null || _a === void 0
+            ? void 0
+            : _a.pushNotification) === null || _b === void 0
+          ? void 0
+          : _b.permission(this.config.safariWebId);
+      const isSubscribedToSafari = !!(
+        isValidPushSubscription &&
+        subscriptionToken &&
+        (subscriptionState === null || subscriptionState === void 0
+          ? void 0
+          : subscriptionState.permission) === "granted" &&
+        (subscriptionState === null || subscriptionState === void 0
+          ? void 0
+          : subscriptionState.deviceToken)
+      );
+      return {
+        subscribed: isSubscribedToSafari,
+        optedOut: !!optedOut,
+      };
+    }
+    const workerState =
+      await this.context.serviceWorkerManager.getActiveState();
+    const workerRegistration =
+      await this.context.serviceWorkerManager.getRegistration();
+    const notificationPermission =
+      await this.context.permissionManager.getNotificationPermission(
+        this.context.appConfig.safariWebId
+      );
+    const isWorkerActive =
+      workerState === ServiceWorkerActiveState.OneSignalWorker;
+    if (!workerRegistration) {
+      /* You can't be subscribed without a service worker registration */
+      return {
+        subscribed: false,
+        optedOut: !!optedOut,
+      };
+    }
+    /*
+     * Removing pushSubscription from this method due to inconsistent behavior between browsers.
+     * Doesn't matter for re-subscribing, worker is present and active.
+     * Previous implementation for reference:
+     * const pushSubscription = await workerRegistration.pushManager.getSubscription();
+     * const isPushEnabled = !!(
+     *   pushSubscription &&
+     *   deviceId &&
+     *   notificationPermission === NotificationPermission.Granted &&
+     *   isWorkerActive
+     * );
+     */
+    const isPushEnabled = !!(
+      isValidPushSubscription &&
+      subscriptionToken &&
+      notificationPermission === NotificationPermission.Granted &&
+      isWorkerActive
+    );
+    return {
+      subscribed: isPushEnabled,
+      optedOut: !!optedOut,
+    };
+  }
+  /**
+   * Broadcasting to the server the fact user tried to subscribe but there was an error during service worker registration.
+   * Do it only once for the first page view.
+   * @param subscriptionState Describes what went wrong with the service worker installation.
+   */
+  async registerFailedSubscription(subscriptionState, context) {
+    if (context.pageViewManager.isFirstPageView()) {
+      context.subscriptionManager.registerSubscription(
+        new RawPushSubscription(),
+        subscriptionState
+      );
+      context.pageViewManager.incrementPageViewCount();
+    }
+  }
+}
+//# sourceMappingURL=SubscriptionManager.js.map
